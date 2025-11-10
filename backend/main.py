@@ -72,8 +72,25 @@ def translate_text_if_needed(text: str, target_language: str) -> str:
             temperature=0.0,
             max_tokens=1500,
         )
-        translated = resp.choices[0].message.content.strip()
-        return translated
+        # robust extraction depending on SDK shape
+        translated = None
+        if isinstance(resp, dict):
+            # openai python client may return dict-like structure
+            choices = resp.get("choices", [])
+            if choices:
+                # new SDK: message -> content
+                translated = choices[0].get("message", {}).get("content")
+        else:
+            # older/other client shapes
+            try:
+                translated = resp.choices[0].message.content
+            except Exception:
+                translated = str(resp)
+
+        if translated is None:
+            return text  # fallback: return original if translation unavailable
+
+        return translated.strip()
     except Exception as e:
         raise RuntimeError(f"Translation failed: {e}")
 
@@ -105,30 +122,49 @@ async def generate_tts(req: TTSRequest, request: Request):
         print(f"Translated text snippet: {translated[:200]}")
 
         # 2) call OpenAI TTS
+        # Request a real audio format (mp3) and convert bytes -> base64 for the frontend.
         tts_resp = client.audio.speech.create(
             model="tts-1",
             voice=req.voice,
             input=translated,
-            response_format="base64",
+            response_format="mp3",  # request mp3 bytes back
         )
 
-        # 3) Extract base64 audio
-        audio_b64 = None
-        if isinstance(tts_resp, dict):
-            audio_b64 = (
-                tts_resp.get("audio")
-                or tts_resp.get("audio_base64")
-                or tts_resp.get("data", {}).get("audio")
-            )
-        else:
-            audio_b64 = getattr(tts_resp, "audio", None) or getattr(tts_resp, "content", None)
+        # 3) Extract raw bytes from the response in a few possible shapes
+        audio_bytes = None
 
-        if not audio_b64:
+        # Some SDK versions put bytes in .content
+        if hasattr(tts_resp, "content") and tts_resp.content:
+            audio_bytes = tts_resp.content
+
+        # Some shapes return bytes-like object when cast to bytes
+        if not audio_bytes:
             try:
-                raw = bytes(tts_resp)
-                audio_b64 = base64.b64encode(raw).decode("utf-8")
+                audio_bytes = bytes(tts_resp)
             except Exception:
-                raise RuntimeError("TTS succeeded but no audio was returned in expected format.")
+                audio_bytes = None
+
+        # Some older/different shapes return a dict with a known key
+        if not audio_bytes and isinstance(tts_resp, dict):
+            # possible keys: 'audio', 'data' -> {'audio': b'...'} etc.
+            audio_bytes = tts_resp.get("audio") or tts_resp.get("data", {}).get("audio") or tts_resp.get("content")
+
+        if not audio_bytes:
+            raise RuntimeError("TTS succeeded but no audio bytes were returned in an expected location.")
+
+        # Ensure bytes type (if it's str containing base64, handle that)
+        if isinstance(audio_bytes, str):
+            # If SDK already returned base64 string, pass it through
+            try:
+                # detect if looks like base64 (heuristic)
+                base64.b64decode(audio_bytes, validate=True)
+                audio_base64 = audio_bytes
+            except Exception:
+                # if it's text but not base64, encode it
+                audio_base64 = base64.b64encode(audio_bytes.encode("utf-8")).decode("utf-8")
+        else:
+            # bytes -> base64 string
+            audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
 
         elapsed = round(time.time() - start_time, 2)
         print(f"TTS generation completed successfully in {elapsed}s")
@@ -137,7 +173,7 @@ async def generate_tts(req: TTSRequest, request: Request):
         return {
             "status": "success",
             "translated_text": translated,
-            "audio_base64": audio_b64,
+            "audio_base64": audio_base64,
         }
 
     except HTTPException as e:
@@ -153,6 +189,6 @@ async def generate_tts(req: TTSRequest, request: Request):
             "status": "error",
             "error": "internal_server_error",
             "message": str(e),
-            "traceback": tb.splitlines()[-5:],  # last few lines
+            "traceback": tb.splitlines()[-10:],  # last few lines for easier debugging
         }
         return JSONResponse(status_code=500, content=error_payload)
