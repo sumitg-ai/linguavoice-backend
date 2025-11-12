@@ -3,3 +3,13 @@ uvicorn
 openai>=1.12.0
 python-multipart
 
+fastapi
+uvicorn[standard]
+openai
+requests
+python-dotenv
+httpx
+supabase
+psycopg2-binary
+sqlalchemy
+alembic
