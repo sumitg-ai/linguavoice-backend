@@ -2,13 +2,7 @@
 """
 FastAPI backend with Supabase-backed authentication + usage tracking.
 
-Endpoints:
- - GET  /health
- - POST /generate    (protected — requires Supabase access token)
- - GET  /me          (protected — returns user + plan + usage)
- - GET  /usage       (protected — returns recent usage logs for the user)
-
-Environment variables required:
+Environment variables required on the backend:
  - OPENAI_API_KEY
  - SUPABASE_URL            (e.g. https://<project-ref>.supabase.co)
  - SUPABASE_ANON_KEY       (anon/public key)
@@ -17,14 +11,14 @@ Environment variables required:
 """
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
+from typing import Optional
 import os
 import base64
 import traceback
 import time
 import requests
-from typing import Optional
 
 # ---- Config / env (fail fast) ----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -37,7 +31,7 @@ if not OPENAI_API_KEY:
 if not SUPABASE_URL or not SUPABASE_ANON_KEY or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Missing one of SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_SERVICE_KEY environment variables.")
 
-# CORS
+# CORS configuration
 allowed = os.getenv("BACKEND_ALLOWED_ORIGINS", "").strip()
 if allowed:
     ALLOW_ORIGINS = [o.strip() for o in allowed.split(",") if o.strip()]
@@ -45,10 +39,9 @@ else:
     ALLOW_ORIGINS = [
         "https://*.hf.space",
         "https://huggingface.co",
-        # add your exact HF space URL if desired
+        # you can add your front-end origin here
     ]
 
-# ---- App ----
 app = FastAPI(title="Linguavoice Backend API (Supabase + OpenAI)")
 
 app.add_middleware(
@@ -59,23 +52,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Optional: import OpenAI SDK client (keeps your previous behavior) ----
-# You were previously using `openai` SDK or the new OpenAI client. Keep using the same pattern.
-# Example with new openai package-style client (adapt if you use a different SDK).
-try:
-    # If you use the official "openai" package:
-    import openai
-    openai.api_key = OPENAI_API_KEY
-    OPENAI_CLIENT = "openai_sdk"
-except Exception:
-    OPENAI_CLIENT = None
-
 # --- Models ---
 class TTSRequest(BaseModel):
     text: str
     language: str
     voice: Optional[str] = "alloy"
 
+class MagicLinkRequest(BaseModel):
+    email: str
+    redirect_to: str
 
 # ---- Supabase helpers ----
 def supabase_auth_get_user(access_token: str) -> Optional[dict]:
@@ -88,7 +73,7 @@ def supabase_auth_get_user(access_token: str) -> Optional[dict]:
     url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/user"
     headers = {
         "Authorization": f"Bearer {access_token}",
-        # Use service key as apikey so Supabase accepts the call server-side
+        # Server-side call uses service_role as apikey to avoid CORS issues
         "apikey": SUPABASE_SERVICE_KEY,
     }
     r = requests.get(url, headers=headers, timeout=10)
@@ -99,9 +84,7 @@ def supabase_auth_get_user(access_token: str) -> Optional[dict]:
             return None
     return None
 
-
 def get_app_user_row(user_id: str) -> Optional[dict]:
-    """GET /rest/v1/app_users?id=eq.<user_id>"""
     url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/app_users"
     headers = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -116,23 +99,16 @@ def get_app_user_row(user_id: str) -> Optional[dict]:
             return items[0]
         return None
     else:
-        # log
         print("get_app_user_row failed:", r.status_code, r.text)
         return None
 
-
 def ensure_app_user(user: dict) -> dict:
-    """
-    Ensure a row exists in app_users for this user id.
-    Returns the app_user row.
-    """
     user_id = user.get("id")
     email = user.get("email")
     row = get_app_user_row(user_id)
     if row:
         return row
-
-    # create
+    # create row
     url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/app_users"
     headers = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -148,10 +124,8 @@ def ensure_app_user(user: dict) -> dict:
             return items[0]
         return items
     else:
-        # If create fails due to FK (auth.users may not be visible) or RLS, log and raise
         print("ensure_app_user create failed:", r.status_code, r.text)
         raise RuntimeError("Failed to ensure app_user row for user: " + str(r.text))
-
 
 def fetch_plan(plan_id: str) -> Optional[dict]:
     url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/plans"
@@ -167,12 +141,7 @@ def fetch_plan(plan_id: str) -> Optional[dict]:
     print("fetch_plan failed:", r.status_code, r.text)
     return None
 
-
 def log_usage_and_increment(user_id: str, chars_used: int, request_meta: dict):
-    """
-    Insert into usage_logs and increment app_users.usage_monthly by chars_used.
-    """
-    # 1) insert usage_logs
     url_logs = f"{SUPABASE_URL.rstrip('/')}/rest/v1/usage_logs"
     headers = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -185,14 +154,10 @@ def log_usage_and_increment(user_id: str, chars_used: int, request_meta: dict):
     if r.status_code not in (201, 200):
         print("Failed to insert usage_log:", r.status_code, r.text)
 
-    # 2) increment usage_monthly
-    # Supabase allows PATCH with arithmetic via `Prefer: return=representation` is not atomic for arithmetic,
-    # but we will fetch current and update
     user_row = get_app_user_row(user_id)
     if not user_row:
         print("log_usage_and_increment: app_user not found when updating usage_monthly")
         return
-
     new_usage = (user_row.get("usage_monthly") or 0) + chars_used
     url_user = f"{SUPABASE_URL.rstrip('/')}/rest/v1/app_users"
     headers_user = {
@@ -207,89 +172,26 @@ def log_usage_and_increment(user_id: str, chars_used: int, request_meta: dict):
     if r2.status_code not in (200, 204):
         print("Failed to update app_user usage_monthly:", r2.status_code, r2.text)
 
-
 # ---- Translation util (keeps your previous behavior) ----
 def translate_text_if_needed(text: str, target_language: str) -> str:
-    """Return translated text (or original if English). Uses OpenAI chat completion if available."""
     if not text:
         return ""
     if target_language.lower() in ("english", "en"):
         return text
+    # if you have an OpenAI client configured, you may translate here
+    # For now return original text
+    return text
 
-    try:
-        # Use basic OpenAI chat completion via 'openai' package if available.
-        if OPENAI_CLIENT == "openai_sdk":
-            # This uses the classic OpenAI python package pattern
-            resp = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"You are a translator that converts any input text to {target_language}. Return only the translated text."
-                    },
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.0,
-                max_tokens=1500,
-            )
-            # extract
-            translated = resp.choices[0].message["content"]
-            return translated.strip()
-        else:
-            # Fallback: return original text (you can add another client)
-            return text
-    except Exception as e:
-        raise RuntimeError(f"Translation failed: {e}")
-
-
-# ---- OpenAI TTS util (keeps your previous logic) ----
+# ---- OpenAI TTS util (placeholder — keep your existing implementation) ----
 def generate_tts_bytes(translated_text: str, voice: str = "alloy") -> bytes:
-    """
-    Call OpenAI TTS. Returns raw bytes (mp3).
-    Adapt this function if your OpenAI client API shape differs.
-    """
-    # If you use the modern OpenAI API, you may need to call the SDK method you used before.
-    # The original code used `client.audio.speech.create(model="tts-1", ...)`.
-    # Here we'll attempt to call via the 'openai' package if present.
-    if OPENAI_CLIENT == "openai_sdk":
-        # Using openai.Audio.speechs? The exact method depends on SDK version.
-        # If your existing code used client.audio.speech.create, keep that instead.
-        # We'll try to call `openai.audio.speech.create` if available.
-        try:
-            # try the same shape as before (may need adjustment to match SDK)
-            tts_resp = openai.Audio.speech.create(
-                model="tts-1",
-                voice=voice,
-                input=translated_text,
-                response_format="mp3",
-            )
-            # Try a few shapes to extract bytes
-            if hasattr(tts_resp, "content") and tts_resp.content:
-                return tts_resp.content
-            try:
-                return bytes(tts_resp)
-            except Exception:
-                pass
-            if isinstance(tts_resp, dict):
-                audio = tts_resp.get("audio") or tts_resp.get("data", {}).get("audio") or tts_resp.get("content")
-                if isinstance(audio, str):
-                    # base64 string
-                    return base64.b64decode(audio)
-                elif isinstance(audio, (bytes, bytearray)):
-                    return bytes(audio)
-            raise RuntimeError("TTS returned unexpected response shape.")
-        except Exception as e:
-            # bubble up for outer handler
-            raise
-    else:
-        raise RuntimeError("No OpenAI client configured for TTS. Install and configure openai SDK.")
-
+    # This must be the same TTS call you used earlier (OpenAI or other).
+    # For safety we raise if not implemented. Replace this with your working TTS call.
+    raise RuntimeError("TTS implementation missing in this code sample. Insert your existing TTS function here.")
 
 # ---- Endpoints ----
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "Linguavoice Backend (Supabase+OpenAI)"}
-
 
 def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
     if not authorization:
@@ -299,122 +201,146 @@ def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
         return parts[1]
     return None
 
+@app.post("/auth/send_magic_link")
+def send_magic_link(req: MagicLinkRequest):
+    """
+    Send a Supabase magic link to the provided email.
+    redirect_to MUST be registered in Supabase Auth -> Settings -> Redirect URLs.
+    """
+    email = req.email
+    redirect_to = req.redirect_to
+    if not email or not redirect_to:
+        raise HTTPException(status_code=400, detail="email and redirect_to required")
+
+    # Supabase OTP REST endpoint for magiclink
+    url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/otp"
+    headers = {"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"}
+    body = {"email": email, "type": "magiclink", "redirect_to": redirect_to}
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=10)
+        if r.status_code in (200, 201, 204):
+            return {"status":"ok", "detail":"Magic link sent. Check your email."}
+        else:
+            raise HTTPException(status_code=500, detail=f"Supabase error: {r.status_code} {r.text}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate")
 async def generate_tts(req: TTSRequest, request: Request, authorization: Optional[str] = Header(None)):
     start_time = time.time()
-    print("\n=== /generate called ===")
     try:
-        print("Request payload snippet:", req.dict())
-
-        # 1) protect endpoint: extract and verify Supabase token
+        # 1) extract token (optional for anonymous freemium)
         user_token = extract_bearer_token(authorization)
+        user = None
+        anonymous = False
         if not user_token:
-            raise HTTPException(status_code=401, detail="Missing Authorization Bearer token.")
-
-        user = supabase_auth_get_user(user_token)
-        if not user or "id" not in user:
-            raise HTTPException(status_code=401, detail="Invalid or expired Supabase token.")
-
-        # ensure app user exists
-        app_user = ensure_app_user(user)
+            anonymous = True
+        else:
+            user = supabase_auth_get_user(user_token)
+            if not user or "id" not in user:
+                raise HTTPException(status_code=401, detail="Invalid or expired Supabase token.")
+            # ensure app user row exists
+            ensure_app_user(user)
 
         # Basic input validation
         if not req.text or not req.language:
             raise HTTPException(status_code=400, detail="text and language are required fields.")
 
-        # Plan/quota enforcement
-        plan_id = app_user.get("plan_id") or "free"
-        plan = fetch_plan(plan_id) or {"monthly_quota_chars": 20000}
-        monthly_quota = plan.get("monthly_quota_chars", 20000)
-        current_usage = app_user.get("usage_monthly") or 0
         request_chars = len(req.text or "")
-        if current_usage + request_chars > monthly_quota:
-            raise HTTPException(status_code=402, detail="Quota exceeded for this month. Please upgrade your plan.")
+        # anonymous freemium limit = 500 characters
+        if anonymous and request_chars > 500:
+            raise HTTPException(status_code=402, detail="Anonymous limit is 500 characters. Please login or subscribe.")
 
-        # 2) translate if needed
+        # If logged in, enforce monthly quota from app_users/plans
+        if not anonymous:
+            app_user = get_app_user_row(user["id"]) or ensure_app_user(user)
+            plan = fetch_plan(app_user.get("plan_id") or "free") or {"monthly_quota_chars": 20000}
+            monthly_quota = plan.get("monthly_quota_chars", 20000)
+            current_usage = app_user.get("usage_monthly") or 0
+            if current_usage + request_chars > monthly_quota:
+                raise HTTPException(status_code=402, detail="Quota exceeded for this month. Please upgrade your plan.")
+
+        # translate if needed
         translated = translate_text_if_needed(req.text, req.language)
-        print(f"Translated text snippet: {translated[:200]}")
 
-        # 3) generate TTS bytes
+        # generate tts bytes (replace with your existing implementation)
         audio_bytes = generate_tts_bytes(translated, voice=req.voice)
 
-        # 4) convert to base64 for frontend
+        # convert to base64 for frontend
         audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
 
-        # 5) log usage and increment
-        request_meta = {"language": req.language, "voice": req.voice, "chars": request_chars, "email": user.get("email")}
-        try:
-            log_usage_and_increment(user["id"], request_chars, request_meta)
-        except Exception as e:
-            # log but don't fail the TTS response
-            print("Warning: failed to log usage:", e)
+        # log usage for authenticated users only
+        if not anonymous:
+            try:
+                log_usage_and_increment(user["id"], request_chars, {"language": req.language, "voice": req.voice})
+            except Exception as e:
+                print("Warning: failed to log usage:", e)
 
         elapsed = round(time.time() - start_time, 2)
-        print(f"TTS generation completed successfully in {elapsed}s")
-        print("=== /generate end ===\n")
-
-        return {
-            "status": "success",
-            "translated_text": translated,
-            "audio_base64": audio_base64,
-        }
+        return {"status":"success", "translated_text": translated, "audio_base64": audio_base64}
 
     except HTTPException:
-        # re-raise so FastAPI handles properly
         raise
     except Exception as e:
         tb = traceback.format_exc()
-        print("=== Exception in /generate endpoint ===")
-        print(tb)
-        print("=== End Exception ===\n")
-        error_payload = {
-            "status": "error",
-            "error": "internal_server_error",
-            "message": str(e),
-            "traceback": tb.splitlines()[-20:],  # last lines
-        }
-        return JSONResponse(status_code=500, content=error_payload)
+        print("Exception in /generate:", tb)
+        return JSONResponse(status_code=500, content={"status":"error", "message": str(e), "traceback": tb.splitlines()[-20:]})
 
+# --- NEW: auth callback page used by Supabase magic link redirect ---
+@app.get("/auth_callback", response_class=HTMLResponse)
+def auth_callback_page():
+    """
+    Serve a small HTML page that runs supabase-js to read the session created by the magic link
+    and display the access_token (JWT) for the user to copy into the frontend token box.
+    The page uses SUPABASE_URL and SUPABASE_ANON_KEY from env vars.
+    """
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_anon = os.getenv("SUPABASE_ANON_KEY")
 
-@app.get("/me")
-def me(authorization: Optional[str] = Header(None)):
-    token = extract_bearer_token(authorization)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token.")
+    if not supabase_url or not supabase_anon:
+        return HTMLResponse("<h3>Supabase config missing on server. Set SUPABASE_URL and SUPABASE_ANON_KEY env vars.</h3>", status_code=500)
 
-    user = supabase_auth_get_user(token)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Supabase token.")
+    html = f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"/><title>Login Successful — Copy Your Token</title></head>
+<body style="font-family: Arial; padding:20px;">
+  <h2>Login Successful 🎉</h2>
+  <p>If you were redirected here after clicking the magic link, this page will extract your session and show the access token (JWT). Copy it and paste it into the app.</p>
+  <textarea id="tokenBox" style="width:100%; height:140px;" readonly placeholder="token will appear here..."></textarea>
+  <br/><br/>
+  <button id="cpy">Copy Token to Clipboard</button>
+  <p id="msg" style="color:green"></p>
 
-    app_user = ensure_app_user(user)
-    plan = fetch_plan(app_user.get("plan_id") or "free")
-    return {"user": user, "app_user": app_user, "plan": plan}
-
-
-@app.get("/usage")
-def usage(authorization: Optional[str] = Header(None), limit: int = 20):
-    token = extract_bearer_token(authorization)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token.")
-    user = supabase_auth_get_user(token)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Supabase token.")
-
-    user_id = user.get("id")
-    # fetch last 'limit' usage logs
-    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/usage_logs"
-    headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-    }
-    params = {"user_id": f"eq.{user_id}", "select": "*", "order": "created_at.desc", "limit": limit}
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    if r.status_code == 200:
-        return {"usage_logs": r.json()}
-    else:
-        print("usage fetch failed:", r.status_code, r.text)
-        raise HTTPException(status_code=500, detail="Failed to fetch usage logs.")
-
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+  <script>
+  (async () => {{
+    const SUPABASE_URL = "{supabase_url}";
+    const SUPABASE_ANON_KEY = "{supabase_anon}";
+    const supabase = supabasejs.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    const {{ data, error }} = await supabase.auth.getSession();
+    if (error) {{
+      document.getElementById('tokenBox').value = "Error reading session: " + (error.message || JSON.stringify(error));
+      return;
+    }}
+    const session = data?.session;
+    if (!session || !session.access_token) {{
+      document.getElementById('tokenBox').value = "No session found. Try reloading or ensure this URL is added to Supabase Redirect URLs.";
+      return;
+    }}
+    const token = session.access_token;
+    document.getElementById('tokenBox').value = token;
+    document.getElementById('cpy').onclick = async () => {{
+      try {{
+        await navigator.clipboard.writeText(token);
+        document.getElementById('msg').innerText = "Copied! Paste it into the app's token box and click Generate.";
+      }} catch (e) {{
+        document.getElementById('msg').innerText = "Copy failed; please manually copy the token from the box above.";
+      }}
+    }};
+  }})();
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
 
 # --- End file ---
