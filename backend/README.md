@@ -1,4 +1,4 @@
-<img width="1363" height="345" alt="image" src="https://github.com/user-attachments/assets/e2e9ecdb-d0e6-43c8-90ea-cf836ea4ef04" /># Linguavoice AI — Multilingual Text-to-Speech (International Edition)
+# Linguavoice AI — Multilingual Text-to-Speech (International Edition)
 
 ## Overview
 Linguavoice AI is a multilingual Text-to-Speech (TTS) platform enabling users to:
@@ -41,7 +41,7 @@ The app includes a **Gradio frontend** deployed on HuggingFace and a **FastAPI b
 
 ### HuggingFace (Frontend)
 BACKEND_URL=https://linguavoice-backend.onrender.com
-<img width="1363" height="345" alt="image" src="https://github.com/user-attachments/assets/44260dfa-12b0-4ae6-8a29-cc7340d0fe1e" />
+<img width="1363" height="345" alt="image" src="https://github.com/user-attachments/assets/e2e9ecdb-d0e6-43c8-90ea-cf836ea4ef04" />
 
 ## Usage
 1. Enter text in any language  
