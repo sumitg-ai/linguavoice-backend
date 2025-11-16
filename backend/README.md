@@ -1,4 +1,4 @@
-# Linguavoice AI — Multilingual Text-to-Speech (International Edition)
+<img width="1363" height="345" alt="image" src="https://github.com/user-attachments/assets/e2e9ecdb-d0e6-43c8-90ea-cf836ea4ef04" /># Linguavoice AI — Multilingual Text-to-Speech (International Edition)
 
 ## Overview
 Linguavoice AI is a multilingual Text-to-Speech (TTS) platform enabling users to:
@@ -36,17 +36,12 @@ The app includes a **Gradio frontend** deployed on HuggingFace and a **FastAPI b
 
 ## Environment Variables
 ### Render (Backend)
-SUPABASE_URL  
-SUPABASE_ANON_KEY  
-SUPABASE_SERVICE_KEY  
-BACKEND_BASE_URL  
-OPENAI_API_KEY  
-OPENAI_TTS_MODEL  
-HF_SPACE_SECRET (optional)  
-HF_SPACE_URL (optional)
+<img width="1221" height="591" alt="image" src="https://github.com/user-attachments/assets/b1397ffa-b715-4e66-821d-21e609029640" />
+
 
 ### HuggingFace (Frontend)
-BACKEND_URL
+BACKEND_URL=https://linguavoice-backend.onrender.com
+<img width="1363" height="345" alt="image" src="https://github.com/user-attachments/assets/44260dfa-12b0-4ae6-8a29-cc7340d0fe1e" />
 
 ## Usage
 1. Enter text in any language  
