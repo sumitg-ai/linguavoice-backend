@@ -1,20 +1,19 @@
 # main.py
 """
 Linguavoice backend (FastAPI) with:
- - existing /generate skeleton (keeps your quota logic)
+ - generate endpoint with TTS implementation (OpenAI primary, Hugging Face fallback)
  - /auth/send_magic_link (calls Supabase OTP)
- - new magic-session endpoints:
-      POST /auth/create_magic_session -> returns {key, redirect_to}
-      POST /auth/receive_token        -> auth_callback posts {key, token}
-      GET  /auth/poll_token?key=...  -> HF Space polls for token
- - GET /auth_callback serves small HTML page that reads Supabase session and posts token to /auth/receive_token
-ENV VARS required on backend (Render):
+ - magic-session endpoints for magic-link auto-fill flow
+ - auth_callback page serving client-side supabase-js
+Env required:
  - SUPABASE_URL
  - SUPABASE_ANON_KEY
  - SUPABASE_SERVICE_KEY
- - OPENAI_API_KEY
- - BACKEND_BASE_URL   (e.g. https://linguavoice-backend.onrender.com)
- - HF_SPACE_URL       (e.g. https://sumitg1979-international-multilingual-tts.hf.space) - optional but recommended
+ - OPENAI_API_KEY (preferred)
+ - BACKEND_BASE_URL
+ - HF_SPACE_SECRET (optional, for HF fallback)
+ - HF_TTS_MODEL (optional, HF model id)
+ - OPENAI_TTS_MODEL (optional, default 'gpt-4o-mini-tts')
 """
 import os
 import time
@@ -35,13 +34,14 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL")   # required
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "")
+HF_SPACE_SECRET = os.getenv("HF_SPACE_SECRET")  # optional fallback
+HF_TTS_MODEL = os.getenv("HF_TTS_MODEL", "tts_models/en/ljspeech/tacotron2-DDC")  # change as desired
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Please set SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY on backend.")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Please set OPENAI_API_KEY on backend.")
 if not BACKEND_BASE_URL:
     raise RuntimeError("Please set BACKEND_BASE_URL on backend (e.g. https://linguavoice-backend.onrender.com)")
 
@@ -72,7 +72,7 @@ class MagicLinkRequest(BaseModel):
     email: str
     redirect_to: str
 
-# -------- Supabase helpers (unchanged logic from your original file) ----------
+# -------- Supabase helpers ----------
 def supabase_auth_get_user(access_token: str) -> Optional[dict]:
     if not access_token:
         return None
@@ -114,10 +114,78 @@ def ensure_app_user(user: dict) -> dict:
         return items[0] if isinstance(items, list) else items
     raise RuntimeError("Failed to ensure app_user row")
 
-# ---------- placeholder TTS function (use your implementation) ----------
+# ---------- TTS implementation ----------
+def generate_tts_bytes_openai(text: str, voice: str = "nova") -> Optional[bytes]:
+    """
+    Try OpenAI TTS (v1/audio/speech). Returns bytes on success or None on failure.
+    """
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        endpoint = "https://api.openai.com/v1/audio/speech"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg"
+        }
+        payload = {
+            "model": OPENAI_TTS_MODEL,
+            "voice": voice,
+            "input": text,
+        }
+        # Use requests to post JSON and get raw audio bytes
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+        if r.status_code == 200 and r.content:
+            return r.content
+        else:
+            # return None to allow fallback
+            print("OpenAI TTS failed", r.status_code, r.text[:500])
+            return None
+    except Exception as e:
+        print("OpenAI TTS error:", e)
+        return None
+
+def generate_tts_bytes_hf(text: str, voice: str = "nova") -> Optional[bytes]:
+    """
+    Try Hugging Face inference API for TTS. Requires HF_SPACE_SECRET env var.
+    Model id can be set in HF_TTS_MODEL env var.
+    """
+    if not HF_SPACE_SECRET:
+        return None
+    try:
+        hf_model = HF_TTS_MODEL
+        endpoint = f"https://api-inference.huggingface.co/models/{hf_model}"
+        headers = {"Authorization": f"Bearer {HF_SPACE_SECRET}"}
+        # Some HF TTS models expect JSON { "inputs": text } or different payloads.
+        payload = {"inputs": text}
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=60, stream=True)
+        # If HF returns 200 with audio bytes, they may be in r.content
+        if r.status_code == 200:
+            return r.content
+        else:
+            print("HF TTS failed", r.status_code, r.text[:500])
+            return None
+    except Exception as e:
+        print("HF TTS error:", e)
+        return None
+
 def generate_tts_bytes(translated_text: str, voice: str = "nova") -> bytes:
-    # Replace with your working TTS implementation. This placeholder raises.
-    raise RuntimeError("TTS implementation missing here. Replace with your existing TTS call.")
+    """
+    Try OpenAI TTS first, then HF inference. Raise on failure.
+    Returns raw audio bytes (mp3 preferred).
+    """
+    # 1) OpenAI
+    audio = generate_tts_bytes_openai(translated_text, voice=voice)
+    if audio:
+        return audio
+
+    # 2) HF fallback
+    audio = generate_tts_bytes_hf(translated_text, voice=voice)
+    if audio:
+        return audio
+
+    # 3) none worked: give explicit message
+    raise RuntimeError("No TTS provider succeeded. Ensure OPENAI_API_KEY and/or HF_SPACE_SECRET + HF_TTS_MODEL are correctly set.")
 
 # ---------- endpoints (health/generate/send magic link) ----------
 @app.get("/health")
@@ -144,7 +212,7 @@ def send_magic_link(req: MagicLinkRequest):
 
 @app.post("/generate")
 def generate_tts(req: TTSRequest, authorization: Optional[str] = Header(None)):
-    # keep your existing generate logic (quota checks, translation, TTS call). This is a simplified wrapper:
+    # keep your existing generate logic (quota checks, translation, TTS call).
     try:
         user_token = None
         if authorization:
@@ -168,18 +236,20 @@ def generate_tts(req: TTSRequest, authorization: Optional[str] = Header(None)):
         if anonymous and chars > 500:
             raise HTTPException(status_code=402, detail="Anonymous users limited to 500 chars. Please login/subscribe.")
 
-        translated = req.text  # translation logic placeholder
+        # translation placeholder (replace with your translation service if any)
+        translated = req.text
 
+        # call TTS (this will try OpenAI then HF)
         audio_bytes = generate_tts_bytes(translated, voice=req.voice)
         audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-        # log usage, update app_user usage etc (your existing implementation can be re-used)
 
+        # log usage, update app_user usage etc (your existing implementation can be re-used)
         return {"status":"success", "translated_text": translated, "audio_base64": audio_b64}
     except HTTPException:
         raise
     except Exception as e:
         tb = traceback.format_exc()
-        return JSONResponse(status_code=500, content={"status":"error","message": str(e), "traceback": tb.splitlines()[-10:]})
+        return JSONResponse(status_code=500, content={"status":"error","message": str(e), "traceback": tb.splitlines()[-20:]})
 
 # ---------- in-memory magic-session store ----------
 _magic_store = {}   # key -> {"token": Optional[str], "created": float}
@@ -195,10 +265,6 @@ def _cleanup_magic_store():
 
 @app.post("/auth/create_magic_session")
 def create_magic_session():
-    """
-    Creates a short-lived key and returns redirect url for Supabase (contains ?key=...).
-    Frontend will use redirect_to returned here when calling /auth/send_magic_link.
-    """
     _cleanup_magic_store()
     key = uuid.uuid4().hex[:16]
     with _magic_lock:
@@ -208,9 +274,6 @@ def create_magic_session():
 
 @app.post("/auth/receive_token")
 def receive_token(payload: dict):
-    """
-    POSTed by auth_callback page: {key, token}
-    """
     key = payload.get("key")
     token = payload.get("token")
     if not key or not token:
@@ -224,9 +287,6 @@ def receive_token(payload: dict):
 
 @app.get("/auth/poll_token")
 def poll_token(key: str):
-    """
-    Polled by HF Space frontend. 204 if token not available yet, 200 + {token} when ready.
-    """
     _cleanup_magic_store()
     with _magic_lock:
         entry = _magic_store.get(key)
@@ -235,18 +295,12 @@ def poll_token(key: str):
         token = entry.get("token")
         if not token:
             return JSONResponse(status_code=204, content={})
-        # one-time: remove mapping so token cannot be polled again
         _magic_store.pop(key, None)
         return {"token": token}
 
 # ---------- auth_callback page (serves HTML) ----------
 @app.get("/auth_callback", response_class=HTMLResponse)
 def auth_callback_page(request: Request):
-    """
-    Serves a small HTML page (client will read Supabase session via supabase-js)
-    and POST { key, token } to backend /auth/receive_token.
-    The page gets SUPABASE_URL and SUPABASE_ANON_KEY from server env and BACKEND_BASE_URL, HF_SPACE_URL.
-    """
     supabase_url = SUPABASE_URL or ""
     supabase_anon = SUPABASE_ANON_KEY or ""
     backend_base = BACKEND_BASE_URL or ""
