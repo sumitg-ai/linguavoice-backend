@@ -1,7 +1,7 @@
 # main.py
 """
 Linguavoice backend (FastAPI) with:
- - generate endpoint with TTS implementation (OpenAI primary, Hugging Face fallback)
+ - generate endpoint with translation (OpenAI) + TTS implementation (OpenAI primary, Hugging Face fallback)
  - /auth/send_magic_link (calls Supabase OTP)
  - magic-session endpoints for magic-link auto-fill flow
  - auth_callback page serving client-side supabase-js
@@ -9,11 +9,11 @@ Env required:
  - SUPABASE_URL
  - SUPABASE_ANON_KEY
  - SUPABASE_SERVICE_KEY
- - OPENAI_API_KEY (preferred)
  - BACKEND_BASE_URL
- - HF_SPACE_SECRET (optional, for HF fallback)
- - HF_TTS_MODEL (optional, HF model id)
- - OPENAI_TTS_MODEL (optional, default 'gpt-4o-mini-tts')
+ - OPENAI_API_KEY (for TTS + translation) - recommended
+ - OPENAI_TTS_MODEL (optional)
+ - HF_SPACE_SECRET (optional fallback)
+ - HF_TTS_MODEL (optional)
 """
 import os
 import time
@@ -65,7 +65,7 @@ app.add_middleware(
 # -------- models ----------
 class TTSRequest(BaseModel):
     text: str
-    language: str
+    language: str    # target language name: "English", "French", "Spanish", "German", "Japanese"
     voice: Optional[str] = "nova"
 
 class MagicLinkRequest(BaseModel):
@@ -114,6 +114,57 @@ def ensure_app_user(user: dict) -> dict:
         return items[0] if isinstance(items, list) else items
     raise RuntimeError("Failed to ensure app_user row")
 
+# ---------- Translation helper (OpenAI chat completion) ----------
+# Map language display names to a clear prompt name
+_LANGUAGE_MAP = {
+    "english": "English",
+    "french": "French",
+    "spanish": "Spanish",
+    "german": "German",
+    "japanese": "Japanese",
+}
+
+def translate_text_via_openai(text: str, target_language: str) -> str:
+    """
+    Translate `text` into the `target_language` using OpenAI Chat Completions (gpt-3.5-turbo).
+    If OPENAI_API_KEY not set, return original text.
+    """
+    if not OPENAI_API_KEY:
+        # fallback: no translation available
+        return text
+
+    target = _LANGUAGE_MAP.get(target_language.strip().lower(), target_language)
+    system_prompt = (
+        f"You are a translation assistant. Translate the user's text into {target} only. "
+        "Do not add commentary or explanations; return only the translated text. Preserve tone and punctuation."
+    )
+    payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 2000
+    }
+    try:
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        if r.status_code == 200:
+            j = r.json()
+            # pull assistant content
+            choices = j.get("choices") or []
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+                return content.strip()
+            return text
+        else:
+            print("OpenAI translate failed", r.status_code, r.text[:400])
+            return text
+    except Exception as e:
+        print("translate_text_via_openai error:", e)
+        return text
+
 # ---------- TTS implementation ----------
 def generate_tts_bytes_openai(text: str, voice: str = "nova") -> Optional[bytes]:
     """
@@ -133,12 +184,10 @@ def generate_tts_bytes_openai(text: str, voice: str = "nova") -> Optional[bytes]
             "voice": voice,
             "input": text,
         }
-        # Use requests to post JSON and get raw audio bytes
         r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
         if r.status_code == 200 and r.content:
             return r.content
         else:
-            # return None to allow fallback
             print("OpenAI TTS failed", r.status_code, r.text[:500])
             return None
     except Exception as e:
@@ -148,7 +197,6 @@ def generate_tts_bytes_openai(text: str, voice: str = "nova") -> Optional[bytes]
 def generate_tts_bytes_hf(text: str, voice: str = "nova") -> Optional[bytes]:
     """
     Try Hugging Face inference API for TTS. Requires HF_SPACE_SECRET env var.
-    Model id can be set in HF_TTS_MODEL env var.
     """
     if not HF_SPACE_SECRET:
         return None
@@ -156,10 +204,8 @@ def generate_tts_bytes_hf(text: str, voice: str = "nova") -> Optional[bytes]:
         hf_model = HF_TTS_MODEL
         endpoint = f"https://api-inference.huggingface.co/models/{hf_model}"
         headers = {"Authorization": f"Bearer {HF_SPACE_SECRET}"}
-        # Some HF TTS models expect JSON { "inputs": text } or different payloads.
         payload = {"inputs": text}
         r = requests.post(endpoint, headers=headers, json=payload, timeout=60, stream=True)
-        # If HF returns 200 with audio bytes, they may be in r.content
         if r.status_code == 200:
             return r.content
         else:
@@ -174,17 +220,12 @@ def generate_tts_bytes(translated_text: str, voice: str = "nova") -> bytes:
     Try OpenAI TTS first, then HF inference. Raise on failure.
     Returns raw audio bytes (mp3 preferred).
     """
-    # 1) OpenAI
     audio = generate_tts_bytes_openai(translated_text, voice=voice)
     if audio:
         return audio
-
-    # 2) HF fallback
     audio = generate_tts_bytes_hf(translated_text, voice=voice)
     if audio:
         return audio
-
-    # 3) none worked: give explicit message
     raise RuntimeError("No TTS provider succeeded. Ensure OPENAI_API_KEY and/or HF_SPACE_SECRET + HF_TTS_MODEL are correctly set.")
 
 # ---------- endpoints (health/generate/send magic link) ----------
@@ -212,12 +253,12 @@ def send_magic_link(req: MagicLinkRequest):
 
 @app.post("/generate")
 def generate_tts(req: TTSRequest, authorization: Optional[str] = Header(None)):
-    # keep your existing generate logic (quota checks, translation, TTS call).
     try:
+        # auth handling (unchanged)
         user_token = None
         if authorization:
             parts = authorization.split()
-            if len(parts)==2 and parts[0].lower()=="bearer":
+            if len(parts) == 2 and parts[0].lower() == "bearer":
                 user_token = parts[1]
         user = None
         anonymous = False
@@ -236,14 +277,20 @@ def generate_tts(req: TTSRequest, authorization: Optional[str] = Header(None)):
         if anonymous and chars > 500:
             raise HTTPException(status_code=402, detail="Anonymous users limited to 500 chars. Please login/subscribe.")
 
-        # translation placeholder (replace with your translation service if any)
+        # ---- translation step: translate input into requested target language ----
+        # req.language is the user's chosen target language name
         translated = req.text
+        try:
+            translated = translate_text_via_openai(req.text, req.language)
+        except Exception as e:
+            # log and fallback to original text
+            print("Translation error:", e)
+            translated = req.text
 
         # call TTS (this will try OpenAI then HF)
         audio_bytes = generate_tts_bytes(translated, voice=req.voice)
         audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
-        # log usage, update app_user usage etc (your existing implementation can be re-used)
         return {"status":"success", "translated_text": translated, "audio_base64": audio_b64}
     except HTTPException:
         raise
@@ -252,7 +299,7 @@ def generate_tts(req: TTSRequest, authorization: Optional[str] = Header(None)):
         return JSONResponse(status_code=500, content={"status":"error","message": str(e), "traceback": tb.splitlines()[-20:]})
 
 # ---------- in-memory magic-session store ----------
-_magic_store = {}   # key -> {"token": Optional[str], "created": float}
+_magic_store = {}
 _magic_lock = Lock()
 _MAGIC_TTL = 300  # seconds (5 minutes)
 
