@@ -124,16 +124,81 @@ _LANGUAGE_MAP = {
     "japanese": "Japanese",
 }
 
-def translate_text_via_openai(text: str, target_language: str) -> str:
+# Normalization map for detection outputs (map likely non-English names to canonical English names)
+_LANGUAGE_NORMALIZE = {
+    "english": "English", "english.": "English",
+    "french": "French", "français": "French", "francais": "French",
+    "spanish": "Spanish", "español": "Spanish", "espanol": "Spanish",
+    "german": "German", "deutsch": "German", "deutsche": "German",
+    "japanese": "Japanese", "日本語": "Japanese", "nihongo": "Japanese",
+}
+
+def _normalize_language_name(name: str) -> str:
+    if not name:
+        return ""
+    key = name.strip().lower()
+    return _LANGUAGE_NORMALIZE.get(key, name.strip())
+
+def detect_language_via_openai(text: str) -> str:
     """
-    Translate `text` into the `target_language` using OpenAI Chat Completions (gpt-3.5-turbo).
-    If OPENAI_API_KEY not set, return original text.
+    Ask OpenAI to detect the language of the provided text and return a canonical name (English).
+    If OPENAI_API_KEY missing or detection fails, return empty string.
     """
     if not OPENAI_API_KEY:
-        # fallback: no translation available
+        return ""
+    try:
+        system_prompt = (
+            "You are a tiny language-detection assistant. Given the user's text, "
+            "return only the language name (one word or phrase), e.g. English, French, German, Japanese, Spanish. "
+            "Do NOT add any extra text or punctuation."
+        )
+        payload = {
+            "model": "gpt-3.5-turbo",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            "temperature": 0.0,
+            "max_tokens": 16
+        }
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            choices = j.get("choices") or []
+            if choices:
+                detected = choices[0].get("message", {}).get("content", "").strip()
+                normalized = _normalize_language_name(detected)
+                return normalized
+    except Exception as e:
+        print("detect_language_via_openai error:", e)
+    return ""
+
+def translate_text_via_openai(text: str, target_language: str) -> str:
+    """
+    Translate `text` into the `target_language` using OpenAI Chat Completions.
+    If OPENAI_API_KEY not set, return original text.
+
+    NEW: First detect source language. If detected == target, skip translation.
+    """
+    if not OPENAI_API_KEY:
         return text
 
-    target = _LANGUAGE_MAP.get(target_language.strip().lower(), target_language)
+    # Normalized target label
+    target = _LANGUAGE_MAP.get(target_language.strip().lower(), target_language).strip()
+
+    # Detect source language and normalize
+    try:
+        detected = detect_language_via_openai(text)
+        if detected:
+            # Compare normalized names (case-insensitive)
+            if detected.strip().lower() == target.strip().lower():
+                # same language: no translation necessary
+                return text
+    except Exception as e:
+        # detection failed, continue to translation attempt but log error
+        print("Language detection failed:", e)
+
     system_prompt = (
         f"You are a translation assistant. Translate the user's text into {target} only. "
         "Do not add commentary or explanations; return only the translated text. Preserve tone and punctuation."
