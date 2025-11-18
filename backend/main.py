@@ -5,6 +5,7 @@ Linguavoice backend (FastAPI) with:
  - /auth/send_magic_link (calls Supabase OTP)
  - magic-session endpoints for magic-link auto-fill flow
  - auth_callback page serving client-side supabase-js
+ - Stripe checkout session creation + webhook handling to update Supabase app_users
 Env required:
  - SUPABASE_URL
  - SUPABASE_ANON_KEY
@@ -12,8 +13,13 @@ Env required:
  - BACKEND_BASE_URL
  - OPENAI_API_KEY (for TTS + translation) - recommended
  - OPENAI_TTS_MODEL (optional)
+ - HF_SPACE_URL (for redirect in callback)
  - HF_SPACE_SECRET (optional fallback)
  - HF_TTS_MODEL (optional)
+ - STRIPE_SECRET_KEY (for creating sessions)
+ - STRIPE_WEBHOOK_SECRET (for verifying webhooks) - recommended
+ - STRIPE_PRICE_ID_PREMIUM (Stripe Price ID for premium plan)
+ - STRIPE_PRICE_ID_BASIC (optional)
 """
 import os
 import time
@@ -21,6 +27,7 @@ import uuid
 import traceback
 import base64
 import requests
+import stripe
 from threading import Lock
 from typing import Optional
 
@@ -35,15 +42,26 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL")   # required
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL")   # required public backend URL
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "")
 HF_SPACE_SECRET = os.getenv("HF_SPACE_SECRET")  # optional fallback
 HF_TTS_MODEL = os.getenv("HF_TTS_MODEL", "tts_models/en/ljspeech/tacotron2-DDC")  # change as desired
 
+# Stripe
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")  # recommended
+STRIPE_PRICE_ID_PREMIUM = os.getenv("STRIPE_PRICE_ID_PREMIUM")
+STRIPE_PRICE_ID_BASIC = os.getenv("STRIPE_PRICE_ID_BASIC")
+
+# Basic validations
 if not SUPABASE_URL or not SUPABASE_ANON_KEY or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Please set SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY on backend.")
 if not BACKEND_BASE_URL:
     raise RuntimeError("Please set BACKEND_BASE_URL on backend (e.g. https://linguavoice-backend.onrender.com)")
+
+# Configure Stripe if key present
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 # CORS - allow HF Space + common domains (add more as needed)
 ALLOW_ORIGINS = [
@@ -71,6 +89,11 @@ class TTSRequest(BaseModel):
 class MagicLinkRequest(BaseModel):
     email: str
     redirect_to: str
+
+class CheckoutRequest(BaseModel):
+    plan: str  # e.g. "premium" or "basic"
+    email: Optional[str] = None
+    user_id: Optional[str] = None  # optional user id to attach to metadata
 
 # -------- Supabase helpers ----------
 def supabase_auth_get_user(access_token: str) -> Optional[dict]:
@@ -114,8 +137,28 @@ def ensure_app_user(user: dict) -> dict:
         return items[0] if isinstance(items, list) else items
     raise RuntimeError("Failed to ensure app_user row")
 
+def update_app_user_by_email(email: str, updates: dict) -> bool:
+    """
+    Update app_users row by email using Supabase REST API and service role key.
+    """
+    try:
+        url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/app_users"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation"
+        }
+        params = {"email": f"eq.{email}"}
+        r = requests.patch(url, headers=headers, params=params, json=updates, timeout=10)
+        if r.status_code in (200, 204):
+            return True
+        print("update_app_user_by_email failed", r.status_code, r.text)
+    except Exception as e:
+        print("update_app_user_by_email error:", e)
+    return False
+
 # ---------- Translation helper (OpenAI chat completion) ----------
-# Map language display names to a clear prompt name
 _LANGUAGE_MAP = {
     "english": "English",
     "french": "French",
@@ -124,7 +167,6 @@ _LANGUAGE_MAP = {
     "japanese": "Japanese",
 }
 
-# Normalization map for detection outputs (map likely non-English names to canonical English names)
 _LANGUAGE_NORMALIZE = {
     "english": "English", "english.": "English",
     "french": "French", "français": "French", "francais": "French",
@@ -140,10 +182,6 @@ def _normalize_language_name(name: str) -> str:
     return _LANGUAGE_NORMALIZE.get(key, name.strip())
 
 def detect_language_via_openai(text: str) -> str:
-    """
-    Ask OpenAI to detect the language of the provided text and return a canonical name (English).
-    If OPENAI_API_KEY missing or detection fails, return empty string.
-    """
     if not OPENAI_API_KEY:
         return ""
     try:
@@ -175,30 +213,16 @@ def detect_language_via_openai(text: str) -> str:
     return ""
 
 def translate_text_via_openai(text: str, target_language: str) -> str:
-    """
-    Translate `text` into the `target_language` using OpenAI Chat Completions.
-    If OPENAI_API_KEY not set, return original text.
-
-    NEW: First detect source language. If detected == target, skip translation.
-    """
     if not OPENAI_API_KEY:
         return text
-
-    # Normalized target label
     target = _LANGUAGE_MAP.get(target_language.strip().lower(), target_language).strip()
-
-    # Detect source language and normalize
     try:
         detected = detect_language_via_openai(text)
         if detected:
-            # Compare normalized names (case-insensitive)
             if detected.strip().lower() == target.strip().lower():
-                # same language: no translation necessary
                 return text
     except Exception as e:
-        # detection failed, continue to translation attempt but log error
         print("Language detection failed:", e)
-
     system_prompt = (
         f"You are a translation assistant. Translate the user's text into {target} only. "
         "Do not add commentary or explanations; return only the translated text. Preserve tone and punctuation."
@@ -217,7 +241,6 @@ def translate_text_via_openai(text: str, target_language: str) -> str:
         r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=30)
         if r.status_code == 200:
             j = r.json()
-            # pull assistant content
             choices = j.get("choices") or []
             if choices:
                 content = choices[0].get("message", {}).get("content", "")
@@ -232,9 +255,6 @@ def translate_text_via_openai(text: str, target_language: str) -> str:
 
 # ---------- TTS implementation ----------
 def generate_tts_bytes_openai(text: str, voice: str = "nova") -> Optional[bytes]:
-    """
-    Try OpenAI TTS (v1/audio/speech). Returns bytes on success or None on failure.
-    """
     if not OPENAI_API_KEY:
         return None
     try:
@@ -260,9 +280,6 @@ def generate_tts_bytes_openai(text: str, voice: str = "nova") -> Optional[bytes]
         return None
 
 def generate_tts_bytes_hf(text: str, voice: str = "nova") -> Optional[bytes]:
-    """
-    Try Hugging Face inference API for TTS. Requires HF_SPACE_SECRET env var.
-    """
     if not HF_SPACE_SECRET:
         return None
     try:
@@ -281,10 +298,6 @@ def generate_tts_bytes_hf(text: str, voice: str = "nova") -> Optional[bytes]:
         return None
 
 def generate_tts_bytes(translated_text: str, voice: str = "nova") -> bytes:
-    """
-    Try OpenAI TTS first, then HF inference. Raise on failure.
-    Returns raw audio bytes (mp3 preferred).
-    """
     audio = generate_tts_bytes_openai(translated_text, voice=voice)
     if audio:
         return audio
@@ -343,12 +356,10 @@ def generate_tts(req: TTSRequest, authorization: Optional[str] = Header(None)):
             raise HTTPException(status_code=402, detail="Anonymous users limited to 500 chars. Please login/subscribe.")
 
         # ---- translation step: translate input into requested target language ----
-        # req.language is the user's chosen target language name
         translated = req.text
         try:
             translated = translate_text_via_openai(req.text, req.language)
         except Exception as e:
-            # log and fallback to original text
             print("Translation error:", e)
             translated = req.text
 
@@ -363,10 +374,110 @@ def generate_tts(req: TTSRequest, authorization: Optional[str] = Header(None)):
         tb = traceback.format_exc()
         return JSONResponse(status_code=500, content={"status":"error","message": str(e), "traceback": tb.splitlines()[-20:]})
 
-# ---------- in-memory magic-session store ----------
+# ---------- Stripe: create checkout session ----------
+@app.post("/create-checkout-session")
+def create_checkout_session(req: CheckoutRequest):
+    """
+    Creates a Stripe Checkout session and returns a session URL for the client to open.
+    Expects plan param: "premium" (or "basic" if configured).
+    Optional email and user_id can be provided; they'll be attached to the Checkout metadata.
+    """
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured on server (STRIPE_SECRET_KEY missing).")
+
+    plan = (req.plan or "premium").lower()
+    if plan == "premium":
+        price_id = STRIPE_PRICE_ID_PREMIUM
+    elif plan == "basic":
+        price_id = STRIPE_PRICE_ID_BASIC or STRIPE_PRICE_ID_PREMIUM
+    else:
+        raise HTTPException(status_code=400, detail="Unknown plan requested")
+
+    if not price_id:
+        raise HTTPException(status_code=500, detail="Stripe price ID not configured for requested plan")
+
+    try:
+        # build success/cancel URLs
+        success_url = BACKEND_BASE_URL.rstrip("/") + "/stripe_success?session_id={CHECKOUT_SESSION_ID}"
+        cancel_url = BACKEND_BASE_URL.rstrip("/")
+
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            customer_email=req.email or None,
+            metadata={"plan": plan, "user_id": req.user_id or ""},
+        )
+        return {"url": session.url, "id": session.id}
+    except Exception as e:
+        print("Stripe create session error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- Stripe webhook endpoint ----------
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    event = None
+
+    # Verify signature if secret configured
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET)
+        except ValueError as e:
+            # Invalid payload
+            print("Webhook invalid payload", e)
+            raise HTTPException(status_code=400, detail="Invalid payload")
+        except stripe.error.SignatureVerificationError as e:
+            print("Webhook signature verification failed", e)
+            raise HTTPException(status_code=400, detail="Signature verification failed")
+    else:
+        # No webhook secret configured - try parsing body directly (less secure)
+        try:
+            event = stripe.Event.construct_from(request.json(), stripe.api_key)
+        except Exception as e:
+            print("Webhook construct event failed", e)
+            raise HTTPException(status_code=400, detail="Invalid webhook event")
+
+    # Handle the event
+    try:
+        typ = event.get("type")
+        data = event.get("data", {}).get("object", {})
+
+        if typ == "checkout.session.completed":
+            session = data
+            email = session.get("customer_details", {}).get("email")
+            subscription_id = session.get("subscription")
+            customer_id = session.get("customer")
+            metadata = session.get("metadata", {}) or {}
+            plan = metadata.get("plan") or "premium"
+
+            # Update Supabase app_users by email
+            if email:
+                updates = {
+                    "is_subscribed": True,
+                    "plan": plan,
+                    "stripe_customer_id": customer_id,
+                    "stripe_subscription_id": subscription_id,
+                    "stripe_checkout_session_id": session.get("id")
+                }
+                success = update_app_user_by_email(email, updates)
+                if not success:
+                    print("Failed to update app_users for", email)
+            else:
+                print("checkout.session.completed missing customer email; cannot update user row.")
+        # Optionally handle subscription.updated, invoice.payment_succeeded etc.
+        return {"status": "ok"}
+    except Exception as e:
+        print("Webhook handler error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- in-memory magic-session store (unchanged) ----------
 _magic_store = {}
 _magic_lock = Lock()
-_MAGIC_TTL = 300  # seconds (5 minutes)
+_MAGIC_TTL = 300  # seconds
 
 def _cleanup_magic_store():
     now = time.time()
