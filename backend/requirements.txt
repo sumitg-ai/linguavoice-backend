@@ -13,3 +13,4 @@ supabase
 psycopg2-binary
 sqlalchemy
 alembic
+stripe
