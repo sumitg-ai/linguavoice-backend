@@ -1,4 +1,4 @@
-# main.py
+# main.py (patched)
 """
 Linguavoice backend (FastAPI) with:
  - generate endpoint with translation (OpenAI) + TTS implementation (OpenAI primary, Hugging Face fallback)
@@ -11,13 +11,13 @@ Env required:
  - SUPABASE_ANON_KEY
  - SUPABASE_SERVICE_KEY
  - BACKEND_BASE_URL
- - OPENAI_API_KEY (for TTS + translation) - recommended
+ - OPENAI_API_KEY (for translation & TTS)
  - OPENAI_TTS_MODEL (optional)
  - HF_SPACE_URL (for redirect in callback)
  - HF_SPACE_SECRET (optional fallback)
  - HF_TTS_MODEL (optional)
- - STRIPE_SECRET_KEY (for creating sessions)
- - STRIPE_WEBHOOK_SECRET (for verifying webhooks) - recommended
+ - STRIPE_SECRET_KEY (for creating sessions; optional)
+ - STRIPE_WEBHOOK_SECRET (for verifying webhooks; recommended)
  - STRIPE_PRICE_ID_PREMIUM (Stripe Price ID for premium plan)
  - STRIPE_PRICE_ID_BASIC (optional)
 """
@@ -33,7 +33,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 # -------- env & sanity checks --------
@@ -410,10 +410,23 @@ def create_checkout_session(req: CheckoutRequest):
             customer_email=req.email or None,
             metadata={"plan": plan, "user_id": req.user_id or ""},
         )
-        return {"url": session.url, "id": session.id}
+
+        # session.url available on recent stripe versions; fallback to constructing
+        url = getattr(session, "url", None) or f"https://checkout.stripe.com/pay/{session.id}"
+        return {"url": url, "id": session.id}
     except Exception as e:
         print("Stripe create session error:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+# Add a small success page so the Checkout redirect doesn't 404
+@app.get("/stripe_success", response_class=HTMLResponse)
+def stripe_success_page(session_id: Optional[str] = None):
+    msg = "<h2>Subscription success</h2><p>Thank you — your checkout completed.</p>"
+    if session_id:
+        msg += f"<p>Session ID: {session_id}</p>"
+    if HF_SPACE_URL:
+        msg += f'<p><a href="{HF_SPACE_URL}" target="_blank">Return to App</a></p>'
+    return HTMLResponse(content=f"<!doctype html><html><body style='font-family:Arial;padding:18px;'>{msg}</body></html>", status_code=200)
 
 # ---------- Stripe webhook endpoint ----------
 @app.post("/stripe/webhook")
@@ -436,7 +449,7 @@ async def stripe_webhook(request: Request):
     else:
         # No webhook secret configured - try parsing body directly (less secure)
         try:
-            event = stripe.Event.construct_from(request.json(), stripe.api_key)
+            event = stripe.Event.construct_from(await request.json(), stripe.api_key)
         except Exception as e:
             print("Webhook construct event failed", e)
             raise HTTPException(status_code=400, detail="Invalid webhook event")
@@ -448,7 +461,9 @@ async def stripe_webhook(request: Request):
 
         if typ == "checkout.session.completed":
             session = data
-            email = session.get("customer_details", {}).get("email")
+            # session object fields differ depending on webhook; handle safely
+            # customer_details may be present
+            email = session.get("customer_details", {}).get("email") or session.get("customer_email")
             subscription_id = session.get("subscription")
             customer_id = session.get("customer")
             metadata = session.get("metadata", {}) or {}
